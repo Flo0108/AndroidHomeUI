@@ -27,6 +27,7 @@ import java.text.DateFormat
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.*
+import java.util.concurrent.Executors
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -112,7 +113,7 @@ class MainActivity : Activity() {
             apps.visibility=if(page==1)View.VISIBLE else View.GONE
             map.visibility=if(page==2)View.VISIBLE else View.GONE
             home.setWeatherMotionActive(page==0 && lifecycleIsResumed())
-            if(page==2)map.onShown()
+            if(page==2)map.onShown() else map.onHidden()
             updateDots(current)
         }
         override fun onInterceptTouchEvent(e: android.view.MotionEvent): Boolean {
@@ -218,25 +219,41 @@ class MainActivity : Activity() {
         private val locate=TextView(this@MainActivity).apply{text="◎";textSize=25f;gravity=Gravity.CENTER;contentDescription="Show my current location";isClickable=true;isFocusable=true}
         private val status=label("TAP ◎ TO LOCATE",10f)
         private val apiButton=TextView(this@MainActivity).apply{text="⚙";textSize=22f;gravity=Gravity.CENTER;contentDescription="Map data and API keys";isClickable=true;isFocusable=true}
+        private val transitButton=TextView(this@MainActivity).apply{text="WIENER LINIEN · LIVE";textSize=10f;gravity=Gravity.CENTER;setPadding(dp(12),dp(8),dp(12),dp(8));isClickable=true;isFocusable=true}
         private val mapPreferences=getSharedPreferences("launcher",MODE_PRIVATE)
+        private val transitWorker=Executors.newSingleThreadExecutor()
+        private val transitHandler=Handler(Looper.getMainLooper())
+        private val transitCatalog by lazy{WienerLinienData(this@MainActivity)}
+        @Volatile private var transitLat=48.2082
+        @Volatile private var transitLon=16.3738
+        @Volatile private var transitZoom=12
+        private var transitEnabled=mapPreferences.getBoolean("wl_live_enabled",true)
+        private var screenVisible=false
+        private var refreshSeconds=mapPreferences.getInt("wl_refresh_seconds",30).coerceIn(20,120)
+        private var lastTransitFetchElapsed=0L
+        private val pollTransit=object:Runnable{override fun run(){if(transitEnabled&&screenVisible)fetchTransit()}}
         private var mapReady=false
         private var mapLoaded=false
         private var lastLocation:Location?=null
+        private var latestTransit:JSONObject?=null
         init{
             addView(mapWeb,LayoutParams(-1,-1))
             addView(status,LayoutParams(-2,-2,Gravity.TOP or Gravity.START).apply{leftMargin=dp(18);topMargin=dp(22)})
+            addView(transitButton,LayoutParams(-2,dp(38),Gravity.TOP or Gravity.START).apply{leftMargin=dp(18);topMargin=dp(48)})
             addView(apiButton,LayoutParams(dp(48),dp(48),Gravity.TOP or Gravity.END).apply{rightMargin=dp(18);topMargin=dp(14)})
             addView(locate,LayoutParams(dp(48),dp(48),Gravity.TOP or Gravity.END).apply{rightMargin=dp(18);topMargin=dp(68)})
             locate.setOnClickListener{locateUser()}
             apiButton.setOnClickListener{showApiSettings()}
+            transitButton.setOnClickListener{setTransitEnabled(!transitEnabled)}
             mapWeb.settings.javaScriptEnabled=true
             mapWeb.settings.domStorageEnabled=true
             mapWeb.settings.cacheMode=android.webkit.WebSettings.LOAD_DEFAULT
-            mapWeb.settings.userAgentString="${mapWeb.settings.userAgentString} HomeLauncher/3.9"
+            mapWeb.settings.userAgentString="${mapWeb.settings.userAgentString} HomeLauncher/4.0"
             mapWeb.addJavascriptInterface(object{
                 @JavascriptInterface fun requestLocation(){runOnUiThread{locateUser()}}
+                @JavascriptInterface fun reportViewport(lat:Double,lon:Double,zoom:Int){transitLat=lat;transitLon=lon;transitZoom=zoom.coerceIn(4,18)}
             },"HomeLauncher")
-            mapWeb.webViewClient=object:WebViewClient(){override fun onPageFinished(view:WebView?,url:String?){mapReady=true;lastLocation?.let{showLocation(it)} }}
+            mapWeb.webViewClient=object:WebViewClient(){override fun onPageFinished(view:WebView?,url:String?){mapReady=true;mapWeb.evaluateJavascript("window.setTransitEnabled($transitEnabled)",null);latestTransit?.let{publishTransit(it)};lastLocation?.let{showLocation(it)} }}
             var pageSwipeFromEdge=false
             mapWeb.setOnTouchListener{view,event->
                 if(event.action==MotionEvent.ACTION_DOWN){
@@ -255,9 +272,47 @@ class MainActivity : Activity() {
             }
         }
         override fun theme(p:Palette){
-            setBackgroundColor(p.bg);status.setTextColor(p.muted);locate.setTextColor(p.fg);apiButton.setTextColor(p.fg)
+            setBackgroundColor(p.bg);status.setTextColor(p.muted);locate.setTextColor(p.fg);apiButton.setTextColor(p.fg);transitButton.setTextColor(p.fg)
+            transitButton.background=GradientDrawable().apply{shape=GradientDrawable.RECTANGLE;cornerRadius=dp(16).toFloat();setColor(Color.argb(225,Color.red(p.bg),Color.green(p.bg),Color.blue(p.bg)));setStroke(dp(1),Color.argb(80,Color.red(p.muted),Color.green(p.muted),Color.blue(p.muted)))}
             locate.background=GradientDrawable().apply{shape=GradientDrawable.OVAL;setColor(Color.argb(225,Color.red(p.bg),Color.green(p.bg),Color.blue(p.bg)));setStroke(dp(1),Color.argb(75,Color.red(p.muted),Color.green(p.muted),Color.blue(p.muted)))}
             applyMapTheme(p)
+        }
+        private fun setTransitEnabled(enabled:Boolean){
+            transitEnabled=enabled;mapPreferences.edit().putBoolean("wl_live_enabled",enabled).apply()
+            transitButton.text=if(enabled)"WIENER LINIEN · LIVE · ${refreshSeconds}s" else "WIENER LINIEN · OFF"
+            if(mapReady)mapWeb.evaluateJavascript("window.setTransitEnabled($enabled)",null)
+            transitHandler.removeCallbacks(pollTransit)
+            if(enabled&&screenVisible)fetchTransit()
+        }
+        private fun fetchTransit(){
+            if(!transitEnabled||!screenVisible)return
+            val now=android.os.SystemClock.elapsedRealtime()
+            val fairUseWait=15_000L-(now-lastTransitFetchElapsed)
+            if(lastTransitFetchElapsed>0L&&fairUseWait>0L){transitHandler.removeCallbacks(pollTransit);transitHandler.postDelayed(pollTransit,fairUseWait);return}
+            lastTransitFetchElapsed=now
+            transitHandler.removeCallbacks(pollTransit)
+            transitButton.text="WIENER LINIEN · UPDATING…"
+            transitWorker.execute{
+                try{
+                    val payload=transitCatalog.fetch(transitLat,transitLon,transitZoom)
+                    runOnUiThread{
+                        if(!screenVisible||!transitEnabled)return@runOnUiThread
+                        latestTransit=payload
+                        if(mapReady)publishTransit(payload)
+                        val count=payload.optJSONArray("stops")?.length()?:0
+                        transitButton.text=if(count>0)"WIENER LINIEN · LIVE · ${refreshSeconds}s" else "WIENER LINIEN · NO STOPS HERE"
+                        val nearest=payload.optJSONArray("stops")?.optJSONObject(0)
+                        status.text=if(nearest!=null)"${nearest.optString("name")}  ·  ${nearest.optString("summary")}" else payload.optString("message","NO LIVE STOPS NEARBY")
+                        transitHandler.postDelayed(pollTransit,refreshSeconds*1000L)
+                    }
+                }catch(error:Exception){runOnUiThread{
+                    if(screenVisible&&transitEnabled){transitButton.text="WIENER LINIEN · RETRYING";transitHandler.postDelayed(pollTransit,refreshSeconds*1000L)}
+                }}
+            }
+        }
+        private fun publishTransit(payload:JSONObject){
+            val bytes=Base64.encodeToString(payload.toString().toByteArray(Charsets.UTF_8),Base64.NO_WRAP)
+            mapWeb.evaluateJavascript("window.setTransitDataEncoded('$bytes')",null)
         }
         private fun applyMapTheme(p:Palette){if(mapReady)mapWeb.evaluateJavascript("window.setDarkMap(${p.bg==GRAPHITE})",null)}
         private val apiKeyPreferences by lazy{getSharedPreferences("map_api_keys",MODE_PRIVATE)}
@@ -287,7 +342,21 @@ class MainActivity : Activity() {
         private fun removeApiKey(name:String){apiKeyPreferences.edit().remove(apiKeyPrefix+Base64.encodeToString(name.toByteArray(Charsets.UTF_8),Base64.NO_WRAP)).apply()}
         private fun showApiSettings(){
             val panel=LinearLayout(this@MainActivity).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(20),dp(8),dp(20),dp(8))}
-            panel.addView(TextView(this@MainActivity).apply{text="WIENER LINIEN · OPEN DATA\nNo API key required. Transit data can be connected as a map layer.";textSize=14f;setTextColor(current.fg)},LinearLayout.LayoutParams(-1,-2).apply{bottomMargin=dp(18)})
+            panel.addView(TextView(this@MainActivity).apply{text="WIENER LINIEN · OPEN DATA\nLive nearby departures. Route motion is estimated from arrivals, not GPS vehicle positions.";textSize=14f;setTextColor(current.fg)},LinearLayout.LayoutParams(-1,-2).apply{bottomMargin=dp(12)})
+            panel.addView(TextView(this@MainActivity).apply{text="REFRESH INTERVAL · MINIMUM 20 SECONDS";textSize=10f;setTextColor(current.muted)})
+            val intervals=listOf(20,30,60,120)
+            val intervalPicker=Spinner(this@MainActivity).apply{
+                adapter=ArrayAdapter(this@MainActivity,android.R.layout.simple_spinner_dropdown_item,intervals.map{"$it seconds"})
+                setSelection(intervals.indexOf(refreshSeconds).coerceAtLeast(0))
+                onItemSelectedListener=object:android.widget.AdapterView.OnItemSelectedListener{
+                    override fun onNothingSelected(parent:android.widget.AdapterView<*>?){}
+                    override fun onItemSelected(parent:android.widget.AdapterView<*>?,view:View?,position:Int,id:Long){
+                        refreshSeconds=intervals[position];mapPreferences.edit().putInt("wl_refresh_seconds",refreshSeconds).apply()
+                        if(transitEnabled&&screenVisible){transitHandler.removeCallbacks(pollTransit);fetchTransit()}
+                        else if(transitEnabled)transitButton.text="WIENER LINIEN · LIVE · ${refreshSeconds}s"
+                    }
+                }
+            };panel.addView(intervalPicker)
             val provider=EditText(this@MainActivity).apply{hint="Provider name (e.g. ÖBB)";setSingleLine(true)}
             val secret=EditText(this@MainActivity).apply{hint="API key";setSingleLine(true);inputType=android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD}
             panel.addView(provider);panel.addView(secret)
@@ -309,7 +378,8 @@ class MainActivity : Activity() {
                 catch(_:Exception){Toast.makeText(this@MainActivity,"Could not securely save this key",Toast.LENGTH_LONG).show()}
             }});refresh();dialog.show()
         }
-        fun onShown(){if(!mapLoaded){mapLoaded=true;mapWeb.loadDataWithBaseURL("https://www.openstreetmap.org/",mapHtml(current.bg==GRAPHITE),"text/html","UTF-8",null)};val coarse=checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)==PackageManager.PERMISSION_GRANTED;val fine=checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED;if(fine||(coarse&&mapPreferences.getBoolean("map_precision_asked",false)))readCurrentLocation()}
+        fun onShown(){screenVisible=true;if(!mapLoaded){mapLoaded=true;mapWeb.loadDataWithBaseURL("https://www.openstreetmap.org/",mapHtml(current.bg==GRAPHITE),"text/html","UTF-8",null)};val coarse=checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)==PackageManager.PERMISSION_GRANTED;val fine=checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED;if(fine||(coarse&&mapPreferences.getBoolean("map_precision_asked",false)))readCurrentLocation();if(transitEnabled)fetchTransit()}
+        fun onHidden(){screenVisible=false;transitHandler.removeCallbacks(pollTransit)}
         fun permissionResult(code:Int,granted:Boolean){if(code==REQUEST_MAP_LOCATION){if(granted)readCurrentLocation()else status.text="LOCATION OFF · TAP ◎ TO RETRY"}}
         private fun locateUser(){
             val coarse=checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)==PackageManager.PERMISSION_GRANTED
@@ -350,25 +420,28 @@ class MainActivity : Activity() {
     private fun mapHtml(darkMode:Boolean)="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><style>
         *{box-sizing:border-box}html,body,#map{margin:0;width:100%;height:100%;overflow:hidden;background:#e7e4de;font-family:Arial,sans-serif;touch-action:none}
         #tiles{position:absolute;inset:0;overflow:hidden}.tile{position:absolute;width:256px;height:256px;user-select:none;-webkit-user-drag:none}
+        #transit{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:4}.transit-track{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;opacity:.26}.transit-flow{fill:none;stroke-width:3;stroke-linecap:round;stroke-dasharray:1 10;animation:snake 1.05s linear infinite}@keyframes snake{to{stroke-dashoffset:-22}}
+        .wl-stop{fill:#f6f3ed;stroke:#bd765c;stroke-width:2}.wl-label{font:10px Arial,sans-serif;fill:#f6f3ed;paint-order:stroke;stroke:#1b201e;stroke-width:3px;stroke-linejoin:round}
         #marker{position:absolute;width:22px;height:22px;border:3px solid #fff;border-radius:50%;background:#bd765c;box-shadow:0 1px 8px #0008;transform:translate(-50%,-50%);display:none;z-index:5}
         #accuracy{position:absolute;width:20px;height:20px;border:1px solid #bd765c88;border-radius:50%;background:#bd765c18;transform:translate(-50%,-50%);display:none;z-index:3;pointer-events:none}
         #marker:after{content:'';position:absolute;inset:-8px;border:1.5px solid #bd765c;border-radius:50%;opacity:.55;animation:pulse 2.8s ease-out infinite}@keyframes pulse{0%{transform:scale(.55);opacity:.65}100%{transform:scale(1.55);opacity:0}}
         #controls{position:absolute;right:16px;top:78px;display:flex;flex-direction:column;gap:8px;z-index:8}.control{width:42px;height:42px;border:0;border-radius:50%;background:#f6f3eddf;color:#252422;font-size:24px;box-shadow:0 2px 12px #0002}
         #credit{position:absolute;right:5px;bottom:5px;z-index:8;background:#f6f3eddd;padding:3px 5px;border-radius:4px;color:#292824;font-size:10px}#credit a{color:inherit}
         body.dark #map{background:#1b201e}body.dark .tile{filter:grayscale(1) invert(.88) brightness(.8) contrast(.88)}body.dark #credit{background:#1b201edd;color:#eee}
-        </style></head><body class="${if(darkMode) "dark" else ""}"><div id="map"><div id="tiles"></div><div id="accuracy"></div><div id="marker"></div><div id="controls"><button class="control" onclick="zoom(1)">+</button><button class="control" onclick="zoom(-1)">−</button><button class="control" onclick="HomeLauncher.requestLocation()">◎</button></div><div id="credit"><a href="https://www.openstreetmap.org/copyright" target="_blank">© OpenStreetMap contributors</a></div></div>
+        </style></head><body class="${if(darkMode) "dark" else ""}"><div id="map"><div id="tiles"></div><svg id="transit"></svg><div id="accuracy"></div><div id="marker"></div><div id="controls"><button class="control" onclick="zoom(1)">+</button><button class="control" onclick="zoom(-1)">−</button><button class="control" onclick="HomeLauncher.requestLocation()">◎</button></div><div id="credit"><a href="https://www.openstreetmap.org/copyright" target="_blank">© OSM · Wiener Linien OGD CC BY 4.0</a></div></div>
         <script>
-        const map=document.getElementById('map'),tiles=document.getElementById('tiles'),marker=document.getElementById('marker'),accuracy=document.getElementById('accuracy');let center={lat:47.5,lon:14.5},user=null,z=6,dark=${darkMode},drag=null,pointers=new Map(),pinch=null;
+        const map=document.getElementById('map'),tiles=document.getElementById('tiles'),marker=document.getElementById('marker'),accuracy=document.getElementById('accuracy'),transit=document.getElementById('transit');let center={lat:48.2082,lon:16.3738},user=null,z=12,dark=${darkMode},drag=null,pointers=new Map(),pinch=null,transitData=null,transitEnabled=true;
         const world=()=>256*Math.pow(2,z),px=()=>({x:(center.lon+180)/360*world(),y:(1-Math.log(Math.tan(center.lat*Math.PI/180)+1/Math.cos(center.lat*Math.PI/180))/Math.PI)/2*world()});
         function fromPx(x,y){const n=world();center.lon=x/n*360-180;center.lat=Math.atan(Math.sinh(Math.PI*(1-2*y/n)))*180/Math.PI;center.lat=Math.max(-85,Math.min(85,center.lat))}
-        function render(){const w=map.clientWidth,h=map.clientHeight,c=px(),left=Math.floor((c.x-w/2)/256),right=Math.floor((c.x+w/2)/256),top=Math.floor((c.y-h/2)/256),bottom=Math.floor((c.y+h/2)/256);tiles.innerHTML='';const n=Math.pow(2,z);for(let ty=top;ty<=bottom;ty++){if(ty<0||ty>=n)continue;for(let tx=left;tx<=right;tx++){const wrapped=((tx%n)+n)%n,img=document.createElement('img');img.className='tile';img.alt='';img.draggable=false;img.src='https://tile.openstreetmap.org/'+z+'/'+wrapped+'/'+ty+'.png';img.style.left=(tx*256-(c.x-w/2))+'px';img.style.top=(ty*256-(c.y-h/2))+'px';tiles.appendChild(img)}}positionMarker(c,w,h)}
+        function render(){const w=map.clientWidth,h=map.clientHeight,c=px(),left=Math.floor((c.x-w/2)/256),right=Math.floor((c.x+w/2)/256),top=Math.floor((c.y-h/2)/256),bottom=Math.floor((c.y+h/2)/256);tiles.innerHTML='';const n=Math.pow(2,z);for(let ty=top;ty<=bottom;ty++){if(ty<0||ty>=n)continue;for(let tx=left;tx<=right;tx++){const wrapped=((tx%n)+n)%n,img=document.createElement('img');img.className='tile';img.alt='';img.draggable=false;img.src='https://tile.openstreetmap.org/'+z+'/'+wrapped+'/'+ty+'.png';img.style.left=(tx*256-(c.x-w/2))+'px';img.style.top=(ty*256-(c.y-h/2))+'px';tiles.appendChild(img)}}positionMarker(c,w,h);renderTransit()}
         function positionMarker(c=px(),w=map.clientWidth,h=map.clientHeight){if(!user){marker.style.display='none';accuracy.style.display='none';return}const u=project(user.lat,user.lon),x=w/2+u.x-c.x,y=h/2+u.y-c.y;marker.style.display='block';marker.style.left=x+'px';marker.style.top=y+'px';accuracy.style.display='block';accuracy.style.left=x+'px';accuracy.style.top=y+'px';const mpp=Math.max(.1,Math.cos(user.lat*Math.PI/180)*2*Math.PI*6378137/world());const diameter=Math.max(22,Math.min(520,2*user.accuracy/mpp));accuracy.style.width=diameter+'px';accuracy.style.height=diameter+'px'}function project(lat,lon){return{x:(lon+180)/360*world(),y:(1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*world()}}
-        function zoom(d){z=Math.max(4,Math.min(18,z+d));render()}window.setDarkMap=v=>{dark=v;document.body.classList.toggle('dark',v)};window.setCurrentLocation=(lat,lon,meters)=>{user={lat,lon,accuracy:meters||0};center={lat,lon};z=user.accuracy>1500?12:user.accuracy>400?14:16;render()};
+        function renderTransit(){transit.replaceChildren();if(!transitEnabled||!transitData)return;const w=map.clientWidth,h=map.clientHeight,c=px(),ns='http://www.w3.org/2000/svg';transit.setAttribute('viewBox','0 0 '+w+' '+h);const xy=p=>{const q=project(p[0],p[1]);return{x:w/2+q.x-c.x,y:h/2+q.y-c.y}},color=line=>{let hash=0;for(let i=0;i<line.length;i++)hash=(hash*31+line.charCodeAt(i))|0;return ['#d88962','#77bba7','#e1b968','#8ca9dc','#c88fae'][Math.abs(hash)%5]};(transitData.tracks||[]).forEach(t=>{const points=t.points||[];if(points.length<2)return;const path=document.createElementNS(ns,'polyline');path.setAttribute('points',points.map(p=>{const q=xy(p);return q.x.toFixed(1)+','+q.y.toFixed(1)}).join(' '));path.setAttribute('stroke',color(t.line));path.setAttribute('class','transit-track');transit.appendChild(path);const flow=path.cloneNode();flow.setAttribute('class','transit-flow');transit.appendChild(flow)});(transitData.stops||[]).forEach(s=>{const p=xy([s.lat,s.lon]);if(p.x<-20||p.y<-20||p.x>w+20||p.y>h+20)return;const group=document.createElementNS(ns,'g'),dot=document.createElementNS(ns,'circle'),title=document.createElementNS(ns,'title');dot.setAttribute('cx',p.x);dot.setAttribute('cy',p.y);dot.setAttribute('r',4.2);dot.setAttribute('class','wl-stop');title.textContent=s.name+' · '+s.summary;group.appendChild(dot);group.appendChild(title);if(z>=13){const text=document.createElementNS(ns,'text');text.setAttribute('x',p.x+7);text.setAttribute('y',p.y-6);text.setAttribute('class','wl-label');text.textContent=(s.lines||[]).slice(0,3).map(l=>l.name+(l.eta>=0?' '+l.eta+'′':'')).join(' · ')||s.name;group.appendChild(text)}transit.appendChild(group)})}window.setTransitEnabled=v=>{transitEnabled=v;renderTransit()};window.setTransitDataEncoded=v=>{try{transitData=JSON.parse(decodeURIComponent(escape(atob(v))));renderTransit()}catch(e){}};
+        function zoom(d){z=Math.max(4,Math.min(18,z+d));render();HomeLauncher.reportViewport(center.lat,center.lon,z)}window.setDarkMap=v=>{dark=v;document.body.classList.toggle('dark',v)};window.setCurrentLocation=(lat,lon,meters)=>{user={lat,lon,accuracy:meters||0};center={lat,lon};z=user.accuracy>1500?12:user.accuracy>400?14:16;render();HomeLauncher.reportViewport(center.lat,center.lon,z)};
         function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}function midpoint(a,b){return{x:(a.x+b.x)/2,y:(a.y+b.y)/2}}
         map.addEventListener('pointerdown',e=>{if(e.target.closest('#controls')||e.target.closest('#credit'))return;map.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.size===1)drag={x:e.clientX,y:e.clientY,c:px()};if(pointers.size===2){drag=null;const p=[...pointers.values()];pinch={distance:dist(p[0],p[1]),zoom:z}}});
         map.addEventListener('pointermove',e=>{if(!pointers.has(e.pointerId))return;pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.size>=2&&pinch){const p=[...pointers.values()],ratio=dist(p[0],p[1])/Math.max(1,pinch.distance),next=Math.max(4,Math.min(18,pinch.zoom+Math.round(Math.log2(ratio))));if(next!==z){z=next;render()}}else if(drag){tiles.style.transform='translate('+(e.clientX-drag.x)+'px,'+(e.clientY-drag.y)+'px)';positionMarker({x:drag.c.x-(e.clientX-drag.x),y:drag.c.y-(e.clientY-drag.y)})}});
-        function endPointer(e){pointers.delete(e.pointerId);if(pointers.size===0){if(drag){const c=drag;fromPx(c.c.x-(e.clientX-c.x),c.c.y-(e.clientY-c.y));tiles.style.transform='';render()}drag=null;pinch=null}else if(pointers.size===1){pinch=null;const p=[...pointers.values()][0];drag={x:p.x,y:p.y,c:px()}}}map.addEventListener('pointerup',endPointer);map.addEventListener('pointercancel',endPointer);
-        map.addEventListener('wheel',e=>{e.preventDefault();zoom(e.deltaY<0?1:-1)},{passive:false});window.addEventListener('resize',render);render();
+        function endPointer(e){pointers.delete(e.pointerId);if(pointers.size===0){if(drag){const c=drag;fromPx(c.c.x-(e.clientX-c.x),c.c.y-(e.clientY-c.y));tiles.style.transform='';transit.style.transform='';render();HomeLauncher.reportViewport(center.lat,center.lon,z)}drag=null;pinch=null}else if(pointers.size===1){pinch=null;const p=[...pointers.values()][0];drag={x:p.x,y:p.y,c:px()}}}map.addEventListener('pointerup',endPointer);map.addEventListener('pointercancel',endPointer);
+        map.addEventListener('wheel',e=>{e.preventDefault();zoom(e.deltaY<0?1:-1)},{passive:false});window.addEventListener('resize',render);render();setTimeout(()=>HomeLauncher.reportViewport(center.lat,center.lon,z),100);
         </script></body></html>"""
 
     private inner class AppsScreen : LinearLayout(this@MainActivity), Themed {

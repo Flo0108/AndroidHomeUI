@@ -1,6 +1,6 @@
 plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
 
 android { namespace 'com.homelauncher.app'; compileSdk 35
-    defaultConfig { applicationId 'com.homelauncher.app'; minSdk 26; targetSdk 34; versionCode 21; versionName '3.9' }
+    defaultConfig { applicationId 'com.homelauncher.app'; minSdk 26; targetSdk 34; versionCode 22; versionName '4.0' }
 }
 kotlin { jvmToolchain(17) }
